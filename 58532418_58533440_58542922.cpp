@@ -3,62 +3,108 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <semaphore.h>
-#include "generate_frame_vector.c"
-#include "compression.c"
 #include <cstring>
+#include <atomic>
 
 using namespace std;
 
-// given in document: FIFO buffer size = 5, generate_frame_vector(l), where l = 8
 #define CACHE_SIZE 5
 #define FRAME_LEN 8
+#define DEFAULT_THREADS 2
+#define DEFAULT_INTERVAL_SECONDS 2
+#define COMPRESS_TIME 3
 
-struct QueueEntry {
-    double* original_frame;
-    double* compressed_frame;
+// Prototype function declarations
+double* generate_frame_vector(int length);
+double* compression(double* frame, int length);
+//Michael-Scott Non-blocking Queue algorithm
+struct Node {
+    double* frame;
+    atomic<Node*> next;
+    
+    Node(double* f = nullptr) : frame(f), next(nullptr) {}
 };
 
-struct Queue {
-    QueueEntry queue[CACHE_SIZE];
-    int front, rear, count;
-
-    bool full() {return count == CACHE_SIZE;}
-    bool empty() {return count == 0;}
-
+struct MSQueue {
+    atomic<Node*> head;
+    atomic<Node*> tail;
+    
+    MSQueue() {
+        Node* dummy = new Node();
+        head.store(dummy);
+        tail.store(dummy);
+    }
+    
+    ~MSQueue() {
+        while (dequeue() != nullptr) {}
+        Node* dummy = head.load();
+        if (dummy) delete dummy;
+    }
+    
     bool enqueue(double* frame) {
-        if (full()) return false;
-        queue[rear].original_frame = frame;
-        queue[rear].compressed_frame = NULL;
-        rear = (rear + 1) % CACHE_SIZE;
-        count++;
-        return true;
+        Node* node = new Node(frame);
+        Node* last, *next;
+        
+        while (true) {
+            last = tail.load(memory_order_acquire);
+            next = last->next.load(memory_order_acquire);
+            
+            if (last == tail.load(memory_order_acquire)) {
+                if (next == nullptr) {
+                    if (last->next.compare_exchange_weak(next, node, memory_order_release)) {
+                        tail.compare_exchange_strong(last, node, memory_order_release);
+                        return true;
+                    }
+                } else {
+                    tail.compare_exchange_strong(last, next, memory_order_release);
+                }
+            }
+        }
     }
+    
     double* dequeue() {
-        if (empty()) return NULL;
-        // id = front;
-        double* output = queue[front].original_frame;
-        front = (front + 1) % CACHE_SIZE;
-        count--;
-        return output;
+        Node* first, *last, *next;
+        double* result;
+        
+        while (true) {
+            first = head.load(memory_order_acquire);
+            last = tail.load(memory_order_acquire);
+            next = first->next.load(memory_order_acquire);
+            
+            if (first == head.load(memory_order_acquire)) {
+                if (first == last) {
+                    if (next == nullptr) {
+                        return nullptr;
+                    }
+                    tail.compare_exchange_strong(last, next, memory_order_release);
+                } else {
+                    result = next->frame;
+                    if (head.compare_exchange_weak(first, next, memory_order_release)) {
+                        delete first;
+                        return result;
+                    }
+                }
+            }
+        }
     }
+    
     double* get_noDequeue() {
-        if (empty()) return NULL;
-        return queue[front].original_frame;
+        Node* first = head.load(memory_order_acquire);
+        Node* next = first->next.load(memory_order_acquire);
+        return (next != nullptr) ? next->frame : nullptr;
     }
-    double* set_compressed(double* compressed) {
-        if (!empty()) queue[front].compressed_frame = compressed;
+    
+    bool empty() {
+        Node* first = head.load(memory_order_acquire);
+        Node* next = first->next.load(memory_order_acquire);
+        return next == nullptr;
+    }
+    
+    bool full() {
+        // Flow control handled by semaphores
+        return false;
     }
 };
-
-Queue frame_cache;
-
-sem_t cache_emptied;
-sem_t cache_loaded; // ready for transformer
-sem_t transformer_loaded; // ready for MSE
-sem_t mse_loaded; // ready for camera
-double temp[FRAME_LEN]; // "temporary frame recorder"
-
-pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
 double calculate_mse(const double* a, const double* b, int len) {
     double mse = 0.0;
@@ -68,85 +114,105 @@ double calculate_mse(const double* a, const double* b, int len) {
     return mse;
 }
 
+struct thread_args {
+    int interval;
+};
 
-void* camera(void* arg) {
-    int INTERVAL_SECONDS = (int)(intptr_t)arg;
-    int done = 0;
-    while(!done) {
-        double* frame = generate_frame_vector(FRAME_LEN);
-        if (!frame) break;
-        // ^^ "After a certain number of frames are generated, the function generate_frame_vector() returns NULL and the camera exits."
+MSQueue frame_cache;
+sem_t cache_emptied;
+sem_t cache_loaded;
+sem_t transformer_loaded;
+sem_t mse_loaded;
+sem_t framebuffer_clear;
+double temp[FRAME_LEN];
+
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t framebuffer_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void* camera(void* input) {
+    struct thread_args *x = (struct thread_args *)input;
+    int INTERVAL_SECONDS = (x->interval);
+
+    while (true) {
         if (frame_cache.full()) sem_wait(&cache_emptied);
-        // ^^ "When the cache is full, the camera has to wait for the signal from the estimator after it deletes a frame from the cache."
-        pthread_mutex_lock(&mutex);
-        frame_cache.enqueue(frame);
-        sleep(INTERVAL_SECONDS);
-        // ^^ "Takes the camera interval seconds to load a frame into the cache."
-        pthread_mutex_unlock(&mutex);
 
+        double* frame = generate_frame_vector(FRAME_LEN);
+        if (frame != NULL) {
+            frame_cache.enqueue(frame);
+            sleep(INTERVAL_SECONDS);
+        }
         sem_post(&cache_loaded);
+        if (!frame) break;
     }
-    return NULL;
+    pthread_exit(NULL);
 }
 
-void* transformer(void* arg) {
-    while (true) {
+void* transformer(void* args) {
+    while (!frame_cache.empty()) {
+        sem_wait(&framebuffer_clear);
         sem_wait(&cache_loaded);
-        pthread_mutex_lock(&mutex);
-        if (frame_cache.empty()) {
-            pthread_mutex_unlock(&mutex);
-            break;
-        }
+
         double* original = frame_cache.get_noDequeue();
+        if (original == NULL) continue;
+
+        pthread_mutex_lock(&framebuffer_mutex);
         memcpy(temp, original, FRAME_LEN * sizeof(double));
-        // ^^ "In the temporary frame recorder"
-        frame_cache.set_compressed(compression(temp, FRAME_LEN));
-        sleep(3);
-        // ^^ "It takes the transformer 3 seconds to compress the extracted frame..."
-        pthread_mutex_unlock(&mutex);
+        compression(temp, FRAME_LEN);
+        sleep(COMPRESS_TIME);
+        pthread_mutex_unlock(&framebuffer_mutex);
+
         sem_post(&transformer_loaded);
-        // ^^ "Signals the estimator to computer the MSE."
     }
-    return NULL;
+    pthread_exit(NULL);
 }
 
-void* estimator(void* arg) {
-    while (true) {
+void* estimator(void* args) {
+    while (!frame_cache.empty()) {
         sem_wait(&transformer_loaded);
-        pthread_mutex_lock(&mutex);
-        if (frame_cache.empty()) {
-            pthread_mutex_unlock(&mutex);
-            break;
-        }
-        double* original = frame_cache.get_noDequeue();
-        double* compressed = temp;
-        // ^^ "...between the compressed frame in the temporary frame recorder and the corresponding original frame in the cache."
-        double mse = calculate_mse(original, compressed, FRAME_LEN);
-        printf("MSE: %f\n", mse);
 
-        frame_cache.dequeue();
-        pthread_mutex_unlock(&mutex);
+        double* original = frame_cache.dequeue();
+        double* compressed = temp;
+        double mse = calculate_mse(original, compressed, FRAME_LEN);
+
+        printf("mse = %f\n", mse);
+        free(original); 
+        
         sem_post(&cache_emptied);
+        sem_post(&framebuffer_clear);
     }
-    return NULL;
+    pthread_exit(NULL);
 }
 
 int main(int argc, char *argv[]) {
-
-    if (argc != 2) {
+    int i, rc, INTERVAL_SECONDS, THREADS;
+    if (argc > 3) {
         printf("Invalid number of arguments.");
         return 0;
     }
-    int INTERVAL_SECONDS = *argv[1] - '0';
+
+    if (argc >= 2) INTERVAL_SECONDS = atoi(argv[1]);
+    else INTERVAL_SECONDS = DEFAULT_INTERVAL_SECONDS;
+    if (argc >= 3) THREADS = atoi(argv[2]);
+    else THREADS = DEFAULT_THREADS;
 
     sem_init(&cache_loaded, 0, 0);
-    sem_init(&cache_emptied, 0, CACHE_SIZE);
+    sem_init(&cache_emptied, 0, 0);
     sem_init(&transformer_loaded, 0, 0);
     sem_init(&mse_loaded, 0, 0);
+    sem_init(&framebuffer_clear, 0, 1);
 
     pthread_t camera_thread, transformer_thread, estimator_thread;
 
-    pthread_create(&camera_thread, NULL, camera, (void *)(intptr_t)INTERVAL_SECONDS);
+    struct thread_args *x = (struct thread_args *)malloc(sizeof(struct thread_args));
+    x->interval = INTERVAL_SECONDS;
+
+    for (i = 0; i < THREADS; i++) {
+        rc = pthread_create(&camera_thread, NULL, camera, (void *)x);
+        if (rc) {
+            cout << "Error when creating camera threads!" << endl;
+            exit(-1);
+        }
+    }
     pthread_create(&transformer_thread, NULL, transformer, NULL);
     pthread_create(&estimator_thread, NULL, estimator, NULL);
 
@@ -158,13 +224,10 @@ int main(int argc, char *argv[]) {
     sem_destroy(&cache_emptied);
     sem_destroy(&transformer_loaded);
     sem_destroy(&mse_loaded);
+    sem_destroy(&framebuffer_clear);
 
     pthread_mutex_destroy(&mutex);
+    pthread_mutex_destroy(&framebuffer_mutex);
 
     return 0;
 }
-
-
-
-
-
