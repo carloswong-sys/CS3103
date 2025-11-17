@@ -17,11 +17,12 @@ using namespace std;
 // Prototype function declarations
 double* generate_frame_vector(int length);
 double* compression(double* frame, int length);
+
+//===================Declare all data types===================
 //Michael-Scott Non-blocking Queue algorithm
 struct Node {
     double* frame;
     atomic<Node*> next;
-    
     Node(double* f = nullptr) : frame(f), next(nullptr) {}
 };
 
@@ -118,15 +119,16 @@ struct thread_args {
     int interval;
 };
 
+//===================Initialize Semaphores and Mutexes===================
 MSQueue frame_cache;
 sem_t cache_emptied;
-sem_t cache_loaded;
-sem_t transformer_loaded;
-sem_t mse_loaded;
+sem_t cache_loaded; // ready for transformer
+sem_t transformer_loaded; // ready for MSE
+sem_t mse_loaded; // ready for camera
 sem_t framebuffer_clear;
-double temp[FRAME_LEN];
+double temp[FRAME_LEN]; // "temporary frame recorder"
 
-pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t generator_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t framebuffer_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void* camera(void* input) {
@@ -135,35 +137,37 @@ void* camera(void* input) {
 
     while (true) {
         if (frame_cache.full()) sem_wait(&cache_emptied);
-
-        double* frame = generate_frame_vector(FRAME_LEN);
+        pthread_mutex_lock(&generator_mutex);
+        double* frame = generate_frame_vector(FRAME_LEN);   // lock the generator each time it is used
+        pthread_mutex_unlock(&generator_mutex);             // so that order of generation is maintained
         if (frame != NULL) {
             frame_cache.enqueue(frame);
-            sleep(INTERVAL_SECONDS);
+            sleep(INTERVAL_SECONDS);        // Simulate time to load a frame into the cache
         }
-        sem_post(&cache_loaded);
-        if (!frame) break;
+        sem_post(&cache_loaded);            // Notify frame is available
+        if (!frame) break;                  // Exit after NULL from generate_frame_vector
     }
     pthread_exit(NULL);
 }
 
 void* transformer(void* args) {
     while (!frame_cache.empty()) {
-        sem_wait(&framebuffer_clear);
+        sem_wait(&framebuffer_clear); // initially 1 to represent clear
         sem_wait(&cache_loaded);
 
-        double* original = frame_cache.get_noDequeue();
+        // CS1: get from cache (protected by M-S queue, therefore no need for mutexes.)
+        double* original = nullptr;
+        original = frame_cache.get_noDequeue();
         if (original == NULL) continue;
 
+        // CS2: put into framebuffer (Proteced by framebuffer_mutex)
         pthread_mutex_lock(&framebuffer_mutex);
         memcpy(temp, original, FRAME_LEN * sizeof(double));
         compression(temp, FRAME_LEN);
-        sleep(COMPRESS_TIME);
-        // ^^ take 3 seconds to compress the extracted frame
+        sleep(COMPRESS_TIME);               // Simulate time to compress the extracted frame
         pthread_mutex_unlock(&framebuffer_mutex);
 
-        sem_post(&transformer_loaded);
-        // ^^ Signals estimator to compute the MSE
+        sem_post(&transformer_loaded);      // Signals estimator to compute the MSE
     }
     pthread_exit(NULL);
 }
@@ -171,13 +175,12 @@ void* transformer(void* args) {
 void* estimator(void* args) {
     while (!frame_cache.empty()) {
         sem_wait(&transformer_loaded);
+        // framebuffer is empty once we get this semaphore
 
         double* original = frame_cache.dequeue();
         double* compressed = temp;
         double mse = calculate_mse(original, compressed, FRAME_LEN);
-
         printf("mse = %f\n", mse);
-        free(original); 
         
         sem_post(&cache_emptied);
         sem_post(&framebuffer_clear);
@@ -204,7 +207,7 @@ int main(int argc, char *argv[]) {
     sem_init(&cache_emptied, 0, 0);
     sem_init(&transformer_loaded, 0, 0);
     sem_init(&mse_loaded, 0, 0);
-    sem_init(&framebuffer_clear, 0, 1);
+    sem_init(&framebuffer_clear, 0, 1); // initially 1 to represent clear
 
     pthread_t camera_thread, transformer_thread, estimator_thread;
 
@@ -220,6 +223,11 @@ int main(int argc, char *argv[]) {
     }
     pthread_create(&transformer_thread, NULL, transformer, NULL);
     pthread_create(&estimator_thread, NULL, estimator, NULL);
+    /* Only 1 of transformer_thread and estimator_thread,
+     * because there is only 1 framebuffer slot,
+     * and each operation is _always_ blocking,
+     * and thus pointless to have multiple threads.
+    */
 
     pthread_join(camera_thread, NULL);
     pthread_join(transformer_thread, NULL);
@@ -232,7 +240,7 @@ int main(int argc, char *argv[]) {
     sem_destroy(&mse_loaded);
     sem_destroy(&framebuffer_clear);
 
-    pthread_mutex_destroy(&mutex);
+    pthread_mutex_destroy(&generator_mutex);
     pthread_mutex_destroy(&framebuffer_mutex);
 
     return 0;
